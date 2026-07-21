@@ -13,6 +13,7 @@ import AVFoundation
 import CoreMedia
 import ScreenCaptureKit
 import ServiceManagement
+import SwiftUI
 
 // MARK: - Config
 
@@ -626,158 +627,283 @@ func openPrivacyPane(_ anchor: String) {
     }
 }
 
-// MARK: - Notch pill (floating recording indicator)
+// MARK: - Recording island (wraps the notch, DynamicNotchKit-style)
+//
+// On notch Macs: a black shape glued to the top edge, wider than the notch,
+// with top corners curving inward — it merges with the physical notch and the
+// content (red dot / timer / stop) lives on its sides. On other displays: a
+// floating pill below the menu bar. Ported from ambien's RecordingIsland.
 
-/// A small capsule hugging the notch (or the menu bar on notchless Macs):
-/// red pulsing dot + timer while recording — click to stop — then amber
-/// pulsing dots while transcribing. Hidden when idle.
-final class NotchPill: NSObject {
-    private let window: NSWindow
-    private let pill = CALayer()
-    private let dot = CALayer()
-    private let dots: [CALayer]
-    private let timeLayer = CATextLayer()
+struct NotchInfo {
+    static var hasNotch: Bool {
+        guard let screen = NSScreen.main, screen.safeAreaInsets.top > 0,
+              let left = screen.auxiliaryTopLeftArea,
+              let right = screen.auxiliaryTopRightArea,
+              left.width > 0, right.width > 0 else { return false }
+        let width = screen.frame.width - left.width - right.width
+        return width > 150 && width < 300
+    }
+
+    static var notchWidth: CGFloat {
+        guard let screen = NSScreen.main,
+              let left = screen.auxiliaryTopLeftArea,
+              let right = screen.auxiliaryTopRightArea else { return 200 }
+        return screen.frame.width - left.width - right.width
+    }
+
+    static var notchHeight: CGFloat {
+        max(NSScreen.main?.safeAreaInsets.top ?? 38, 38)
+    }
+}
+
+/// Rounded rect whose top corners curve INWARD, matching the notch's own
+/// curvature, so the shape reads as an extension of the notch.
+struct NotchShape: Shape {
+    var topCornerRadius: CGFloat = 6
+    var bottomCornerRadius: CGFloat = 14
+
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: rect.minX, y: rect.minY))
+        p.addQuadCurve(to: CGPoint(x: rect.minX + topCornerRadius, y: rect.minY + topCornerRadius),
+                       control: CGPoint(x: rect.minX + topCornerRadius, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.minX + topCornerRadius, y: rect.maxY - bottomCornerRadius))
+        p.addQuadCurve(to: CGPoint(x: rect.minX + topCornerRadius + bottomCornerRadius, y: rect.maxY),
+                       control: CGPoint(x: rect.minX + topCornerRadius, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.maxX - topCornerRadius - bottomCornerRadius, y: rect.maxY))
+        p.addQuadCurve(to: CGPoint(x: rect.maxX - topCornerRadius, y: rect.maxY - bottomCornerRadius),
+                       control: CGPoint(x: rect.maxX - topCornerRadius, y: rect.maxY))
+        p.addLine(to: CGPoint(x: rect.maxX - topCornerRadius, y: rect.minY + topCornerRadius))
+        p.addQuadCurve(to: CGPoint(x: rect.maxX, y: rect.minY),
+                       control: CGPoint(x: rect.maxX - topCornerRadius, y: rect.minY))
+        p.addLine(to: CGPoint(x: rect.minX, y: rect.minY))
+        return p
+    }
+}
+
+final class IslandModel: ObservableObject {
+    enum Mode { case recording(Date), transcribing }
+    @Published var mode: Mode = .transcribing
+    @Published var tick = Date() // heartbeat so the timer text refreshes
+}
+
+struct RecIslandView: View {
+    @ObservedObject var model: IslandModel
+    let hasNotch: Bool
+    let onStop: () -> Void
+    @State private var hovered = false
+
+    private let leftWidth: CGFloat = 50
+    private let rightCompact: CGFloat = 70
+    private let rightExpanded: CGFloat = 110
+
+    private var isRecording: Bool {
+        if case .recording = model.mode { return true }
+        return false
+    }
+
+    private var timerText: String {
+        guard case .recording(let start) = model.mode else { return "" }
+        let s = Int(model.tick.timeIntervalSince(start))
+        return String(format: "%02d:%02d", s / 60, s % 60)
+    }
+
+    var body: some View {
+        Group {
+            if hasNotch { notchBody } else { pillBody }
+        }
+        .onHover { hovered = $0 }
+    }
+
+    // MARK: notch variant
+
+    private var expandedWidth: CGFloat { leftWidth + NotchInfo.notchWidth + rightExpanded }
+    private var visibleWidth: CGFloat {
+        isRecording ? leftWidth + NotchInfo.notchWidth + (hovered ? rightExpanded : rightCompact)
+                    : leftWidth + NotchInfo.notchWidth + leftWidth
+    }
+
+    private var notchBody: some View {
+        ZStack(alignment: .leading) {
+            NotchShape().fill(Color.black)
+            HStack(spacing: 0) {
+                Group {
+                    if isRecording {
+                        PulsingDot(color: .red, size: 10)
+                    } else {
+                        PulsingDot(color: .white.opacity(0.85), size: 9)
+                    }
+                }
+                .frame(width: leftWidth)
+                Spacer().frame(width: NotchInfo.notchWidth)
+                HStack(spacing: 8) {
+                    if isRecording {
+                        Text(timerText)
+                            .font(.system(size: 12, weight: .medium, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.8))
+                        Button(action: onStop) {
+                            Image(systemName: "stop.fill")
+                                .font(.system(size: 9))
+                                .foregroundColor(.white)
+                                .frame(width: 22, height: 22)
+                                .background(Circle().fill(Color.red))
+                        }
+                        .buttonStyle(.plain)
+                        .opacity(hovered ? 1 : 0)
+                    }
+                }
+                .frame(width: rightExpanded, alignment: .leading)
+            }
+        }
+        .frame(width: expandedWidth, height: NotchInfo.notchHeight, alignment: .leading)
+        .mask(
+            HStack(spacing: 0) {
+                NotchShape()
+                    .frame(width: visibleWidth, height: NotchInfo.notchHeight, alignment: .leading)
+                Spacer(minLength: 0)
+            }
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { if isRecording { onStop() } }
+        .animation(.spring(response: 0.25, dampingFraction: 0.8), value: visibleWidth)
+    }
+
+    // MARK: floating pill fallback (no notch)
+
+    private var pillBody: some View {
+        HStack(spacing: 10) {
+            if isRecording {
+                PulsingDot(color: .red, size: 9)
+                Text(timerText)
+                    .font(.system(size: 12, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.8))
+                if hovered {
+                    Button(action: onStop) {
+                        Image(systemName: "stop.fill")
+                            .font(.system(size: 8))
+                            .foregroundColor(.white)
+                            .frame(width: 20, height: 20)
+                            .background(Circle().fill(Color.red))
+                    }
+                    .buttonStyle(.plain)
+                    .transition(.scale.combined(with: .opacity))
+                }
+            } else {
+                PulsingDot(color: .white.opacity(0.85), size: 9)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Capsule().fill(Color(white: 0.08)))
+        .contentShape(Capsule())
+        .onTapGesture { if isRecording { onStop() } }
+        .animation(.easeInOut(duration: 0.15), value: hovered)
+    }
+}
+
+struct PulsingDot: View {
+    let color: Color
+    let size: CGFloat
+    @State private var pulsing = false
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: size, height: size)
+            .opacity(pulsing ? 0.35 : 1)
+            .animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: pulsing)
+            .onAppear { pulsing = true }
+    }
+}
+
+/// Owns the island panel; same API the app uses regardless of notch.
+final class RecordingIsland {
+    private var panel: NSPanel?
+    private let model = IslandModel()
     private var clock: Timer?
-    private var startedAt = Date()
     private let onStop: () -> Void
-
-    private let W: CGFloat = 96, H: CGFloat = 24
 
     init(onStop: @escaping () -> Void) {
         self.onStop = onStop
-        let frame = NSRect(x: 0, y: 0, width: W, height: H)
-        window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        dots = (0..<3).map { _ in CALayer() }
-        super.init()
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.level = .statusBar
-        window.hasShadow = true
-        window.isReleasedWhenClosed = false
-        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
-
-        let content = NSView(frame: frame)
-        content.wantsLayer = true
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
-
-        pill.frame = frame
-        pill.backgroundColor = NSColor.black.withAlphaComponent(0.85).cgColor
-        pill.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
-        pill.borderWidth = 1
-        pill.cornerRadius = H / 2
-        content.layer?.addSublayer(pill)
-
-        dot.backgroundColor = NSColor.systemRed.cgColor
-        dot.bounds = CGRect(x: 0, y: 0, width: 8, height: 8)
-        dot.cornerRadius = 4
-        dot.position = CGPoint(x: 18, y: H / 2)
-        content.layer?.addSublayer(dot)
-
-        for (i, d) in dots.enumerated() {
-            d.backgroundColor = NSColor.systemOrange.cgColor
-            d.bounds = CGRect(x: 0, y: 0, width: 5, height: 5)
-            d.cornerRadius = 2.5
-            d.position = CGPoint(x: W / 2 - 12 + CGFloat(i) * 12, y: H / 2)
-            d.opacity = 0
-            content.layer?.addSublayer(d)
-        }
-
-        timeLayer.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        timeLayer.fontSize = 11
-        timeLayer.foregroundColor = NSColor.white.withAlphaComponent(0.95).cgColor
-        timeLayer.alignmentMode = .left
-        timeLayer.contentsScale = scale
-        timeLayer.frame = CGRect(x: 30, y: 4.5, width: W - 34, height: 15)
-        content.layer?.addSublayer(timeLayer)
-
-        window.contentView = content
-        content.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(clicked)))
-        content.toolTip = "Click to stop recording"
-    }
-
-    @objc private func clicked() { onStop() }
-
-    /// Snug under the notch when there is one, under the menu bar otherwise.
-    private func position() {
-        guard let screen = NSScreen.main else { return }
-        let x = screen.frame.midX - W / 2
-        let y: CGFloat
-        if screen.safeAreaInsets.top > 0 {
-            y = screen.frame.maxY - screen.safeAreaInsets.top - H - 4
-        } else {
-            y = screen.visibleFrame.maxY - H - 6
-        }
-        window.setFrameOrigin(NSPoint(x: x, y: y))
     }
 
     func showRecording(startedAt: Date) {
-        self.startedAt = startedAt
-        dot.isHidden = false
-        timeLayer.isHidden = false
-        dots.forEach { $0.opacity = 0; $0.removeAllAnimations() }
-        let pulse = CABasicAnimation(keyPath: "opacity")
-        pulse.fromValue = 1.0
-        pulse.toValue = 0.35
-        pulse.duration = 0.6
-        pulse.autoreverses = true
-        pulse.repeatCount = .infinity
-        dot.add(pulse, forKey: "pulse")
-        tick()
+        model.mode = .recording(startedAt)
+        model.tick = Date()
         clock?.invalidate()
-        clock = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
-        window.contentView?.toolTip = "Click to stop recording"
-        position()
-        fadeIn()
+        clock = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.model.tick = Date()
+        }
+        present()
     }
 
     func showTranscribing() {
         clock?.invalidate()
         clock = nil
-        dot.removeAllAnimations()
-        dot.isHidden = true
-        timeLayer.isHidden = true
-        for (i, d) in dots.enumerated() {
-            d.opacity = 1
-            let pulse = CABasicAnimation(keyPath: "opacity")
-            pulse.fromValue = 1.0
-            pulse.toValue = 0.3
-            pulse.duration = 0.45
-            pulse.autoreverses = true
-            pulse.repeatCount = .infinity
-            pulse.beginTime = CACurrentMediaTime() + Double(i) * 0.15
-            d.add(pulse, forKey: "pulse")
-        }
-        window.contentView?.toolTip = "Transcribing…"
-        position()
-        fadeIn()
+        model.mode = .transcribing
+        present()
     }
 
     func hide() {
         clock?.invalidate()
         clock = nil
+        guard let panel else { return }
         NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.2
-            window.animator().alphaValue = 0
+            ctx.duration = 0.15
+            panel.animator().alphaValue = 0
         }, completionHandler: { [weak self] in
-            self?.window.orderOut(nil)
+            panel.orderOut(nil)
+            self?.panel = nil
         })
     }
 
-    private func fadeIn() {
-        window.alphaValue = 0
-        window.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.25
-            window.animator().alphaValue = 1
+    private func present() {
+        if panel != nil {
+            panel?.orderFrontRegardless()
+            return
         }
-    }
+        let hasNotch = NotchInfo.hasNotch
+        let view = RecIslandView(model: model, hasNotch: hasNotch) { [weak self] in
+            self?.onStop()
+        }
+        let hosting = NSHostingView(rootView: view)
 
-    private func tick() {
-        let s = Int(Date().timeIntervalSince(startedAt))
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        timeLayer.string = String(format: "%d:%02d", s / 60, s % 60)
-        CATransaction.commit()
+        let size: NSSize = hasNotch
+            ? NSSize(width: 50 + NotchInfo.notchWidth + 110, height: NotchInfo.notchHeight)
+            : NSSize(width: 180, height: 36)
+        let p = NSPanel(contentRect: NSRect(origin: .zero, size: size),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = !hasNotch
+        p.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+        p.isMovableByWindowBackground = false
+        p.hidesOnDeactivate = false
+        p.isReleasedWhenClosed = false
+        hosting.frame = NSRect(origin: .zero, size: size)
+        p.contentView = hosting
+
+        if let screen = NSScreen.main {
+            if hasNotch {
+                // Align the shape so its notch spacer sits exactly on the notch.
+                let x = screen.frame.midX - NotchInfo.notchWidth / 2 - 50
+                let y = screen.frame.maxY - size.height
+                p.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+            } else {
+                p.setFrameOrigin(NSPoint(x: screen.frame.midX - size.width / 2,
+                                         y: screen.frame.maxY - 60))
+            }
+        }
+
+        panel = p
+        p.alphaValue = 0
+        p.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.2
+            p.animator().alphaValue = 1
+        }
     }
 }
 
@@ -977,7 +1103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let recorder = Recorder()
     private let settings = SettingsController()
-    private var pill: NotchPill!
+    private var pill: RecordingIsland!
     private let toggleItem = NSMenuItem()
     private let statusLine = NSMenuItem()
     private var clock: Timer?
@@ -985,7 +1111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? FileManager.default.createDirectory(at: recordingsRoot, withIntermediateDirectories: true)
-        pill = NotchPill { [weak self] in
+        pill = RecordingIsland { [weak self] in
             guard let self, self.recorder.isRecording else { return }
             self.stopFlow()
         }
