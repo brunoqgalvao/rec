@@ -12,6 +12,7 @@ import AppKit
 import AVFoundation
 import CoreMedia
 import ScreenCaptureKit
+import ServiceManagement
 
 // MARK: - Config
 
@@ -594,11 +595,389 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+// MARK: - Config file writing
+
+/// Updates KEY=VALUE lines in ~/.rec in place, preserving everything else,
+/// then reloads the live config.
+func updateConfigFile(_ values: [String: String]) {
+    let url = home.appendingPathComponent(".rec")
+    var lines = (try? String(contentsOf: url, encoding: .utf8))?
+        .split(separator: "\n", omittingEmptySubsequences: false).map(String.init) ?? []
+    while lines.last?.isEmpty == true { lines.removeLast() }
+    var remaining = values
+    for (i, line) in lines.enumerated() {
+        guard !line.hasPrefix("#"), let eq = line.firstIndex(of: "=") else { continue }
+        if let value = remaining.removeValue(forKey: String(line[..<eq])) {
+            lines[i] = "\(line[..<eq])=\(value)"
+        }
+    }
+    for (key, value) in remaining.sorted(by: { $0.key < $1.key }) {
+        lines.append("\(key)=\(value)")
+    }
+    try? (lines.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    config = loadConfig()
+}
+
+/// Jumps straight to a Privacy & Security pane (e.g. "Privacy_Microphone").
+func openPrivacyPane(_ anchor: String) {
+    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
+        NSWorkspace.shared.open(url)
+    }
+}
+
+// MARK: - Notch pill (floating recording indicator)
+
+/// A small capsule hugging the notch (or the menu bar on notchless Macs):
+/// red pulsing dot + timer while recording — click to stop — then amber
+/// pulsing dots while transcribing. Hidden when idle.
+final class NotchPill: NSObject {
+    private let window: NSWindow
+    private let pill = CALayer()
+    private let dot = CALayer()
+    private let dots: [CALayer]
+    private let timeLayer = CATextLayer()
+    private var clock: Timer?
+    private var startedAt = Date()
+    private let onStop: () -> Void
+
+    private let W: CGFloat = 96, H: CGFloat = 24
+
+    init(onStop: @escaping () -> Void) {
+        self.onStop = onStop
+        let frame = NSRect(x: 0, y: 0, width: W, height: H)
+        window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        dots = (0..<3).map { _ in CALayer() }
+        super.init()
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.level = .statusBar
+        window.hasShadow = true
+        window.isReleasedWhenClosed = false
+        window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+
+        let content = NSView(frame: frame)
+        content.wantsLayer = true
+        let scale = NSScreen.main?.backingScaleFactor ?? 2
+
+        pill.frame = frame
+        pill.backgroundColor = NSColor.black.withAlphaComponent(0.85).cgColor
+        pill.borderColor = NSColor.white.withAlphaComponent(0.16).cgColor
+        pill.borderWidth = 1
+        pill.cornerRadius = H / 2
+        content.layer?.addSublayer(pill)
+
+        dot.backgroundColor = NSColor.systemRed.cgColor
+        dot.bounds = CGRect(x: 0, y: 0, width: 8, height: 8)
+        dot.cornerRadius = 4
+        dot.position = CGPoint(x: 18, y: H / 2)
+        content.layer?.addSublayer(dot)
+
+        for (i, d) in dots.enumerated() {
+            d.backgroundColor = NSColor.systemOrange.cgColor
+            d.bounds = CGRect(x: 0, y: 0, width: 5, height: 5)
+            d.cornerRadius = 2.5
+            d.position = CGPoint(x: W / 2 - 12 + CGFloat(i) * 12, y: H / 2)
+            d.opacity = 0
+            content.layer?.addSublayer(d)
+        }
+
+        timeLayer.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        timeLayer.fontSize = 11
+        timeLayer.foregroundColor = NSColor.white.withAlphaComponent(0.95).cgColor
+        timeLayer.alignmentMode = .left
+        timeLayer.contentsScale = scale
+        timeLayer.frame = CGRect(x: 30, y: 4.5, width: W - 34, height: 15)
+        content.layer?.addSublayer(timeLayer)
+
+        window.contentView = content
+        content.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(clicked)))
+        content.toolTip = "Click to stop recording"
+    }
+
+    @objc private func clicked() { onStop() }
+
+    /// Snug under the notch when there is one, under the menu bar otherwise.
+    private func position() {
+        guard let screen = NSScreen.main else { return }
+        let x = screen.frame.midX - W / 2
+        let y: CGFloat
+        if screen.safeAreaInsets.top > 0 {
+            y = screen.frame.maxY - screen.safeAreaInsets.top - H - 4
+        } else {
+            y = screen.visibleFrame.maxY - H - 6
+        }
+        window.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    func showRecording(startedAt: Date) {
+        self.startedAt = startedAt
+        dot.isHidden = false
+        timeLayer.isHidden = false
+        dots.forEach { $0.opacity = 0; $0.removeAllAnimations() }
+        let pulse = CABasicAnimation(keyPath: "opacity")
+        pulse.fromValue = 1.0
+        pulse.toValue = 0.35
+        pulse.duration = 0.6
+        pulse.autoreverses = true
+        pulse.repeatCount = .infinity
+        dot.add(pulse, forKey: "pulse")
+        tick()
+        clock?.invalidate()
+        clock = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
+        window.contentView?.toolTip = "Click to stop recording"
+        position()
+        fadeIn()
+    }
+
+    func showTranscribing() {
+        clock?.invalidate()
+        clock = nil
+        dot.removeAllAnimations()
+        dot.isHidden = true
+        timeLayer.isHidden = true
+        for (i, d) in dots.enumerated() {
+            d.opacity = 1
+            let pulse = CABasicAnimation(keyPath: "opacity")
+            pulse.fromValue = 1.0
+            pulse.toValue = 0.3
+            pulse.duration = 0.45
+            pulse.autoreverses = true
+            pulse.repeatCount = .infinity
+            pulse.beginTime = CACurrentMediaTime() + Double(i) * 0.15
+            d.add(pulse, forKey: "pulse")
+        }
+        window.contentView?.toolTip = "Transcribing…"
+        position()
+        fadeIn()
+    }
+
+    func hide() {
+        clock?.invalidate()
+        clock = nil
+        NSAnimationContext.runAnimationGroup({ ctx in
+            ctx.duration = 0.2
+            window.animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            self?.window.orderOut(nil)
+        })
+    }
+
+    private func fadeIn() {
+        window.alphaValue = 0
+        window.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.25
+            window.animator().alphaValue = 1
+        }
+    }
+
+    private func tick() {
+        let s = Int(Date().timeIntervalSince(startedAt))
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        timeLayer.string = String(format: "%d:%02d", s / 60, s % 60)
+        CATransaction.commit()
+    }
+}
+
+// MARK: - Settings window
+
+final class SettingsController: NSObject {
+    private var window: NSWindow?
+    private let engineControl = NSSegmentedControl(labels: ["AssemblyAI", "On-device"],
+                                                   trackingMode: .selectOne, target: nil, action: nil)
+    private let engineCaption = NSTextField(wrappingLabelWithString: "")
+    private let keyField = NSTextField()
+    private let keyEntryRow = NSStackView()
+    private let keyAddedLabel = NSTextField(labelWithString: "")
+    private let keyAddedRow = NSStackView()
+    private let gainSlider = NSSlider(value: 10, minValue: 1, maxValue: 20, target: nil, action: nil)
+    private let gainValue = NSTextField(labelWithString: "")
+    private var permissionRows: [(dot: NSTextField, granted: () -> Bool)] = []
+    private var permissionsTimer: Timer?
+
+    func show() {
+        if window == nil { build() }
+        refresh()
+        refreshPermissions()
+        permissionsTimer?.invalidate()
+        permissionsTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
+            guard let self, self.window?.isVisible == true else { timer.invalidate(); return }
+            self.refreshPermissions()
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func caption(_ text: String) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        label.textColor = .secondaryLabelColor
+        label.isSelectable = false
+        label.preferredMaxLayoutWidth = 360
+        return label
+    }
+
+    private func build() {
+        engineControl.target = self
+        engineControl.action = #selector(engineToggled)
+        engineControl.segmentDistribution = .fillEqually
+
+        engineCaption.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        engineCaption.textColor = .secondaryLabelColor
+        engineCaption.isSelectable = false
+        engineCaption.preferredMaxLayoutWidth = 360
+
+        keyField.placeholderString = "AssemblyAI API key"
+        keyField.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        let add = NSButton(title: "Add", target: self, action: #selector(addKeyTapped))
+        add.keyEquivalent = "\r"
+        add.bezelStyle = .rounded
+        keyEntryRow.orientation = .horizontal
+        keyEntryRow.addArrangedSubview(keyField)
+        keyEntryRow.addArrangedSubview(add)
+
+        let check = NSImageView(image: NSImage(systemSymbolName: "checkmark.circle.fill",
+                                               accessibilityDescription: "key added")!)
+        let replace = NSButton(title: "Replace…", target: self, action: #selector(replaceKeyTapped))
+        replace.bezelStyle = .inline
+        replace.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        keyAddedRow.orientation = .horizontal
+        keyAddedRow.spacing = 6
+        keyAddedRow.addArrangedSubview(check)
+        keyAddedRow.addArrangedSubview(keyAddedLabel)
+        keyAddedRow.addArrangedSubview(NSView())
+        keyAddedRow.addArrangedSubview(replace)
+
+        gainSlider.target = self
+        gainSlider.action = #selector(gainChanged)
+        gainValue.font = .monospacedDigitSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        gainValue.textColor = .secondaryLabelColor
+        let gainRow = NSStackView(views: [NSTextField(labelWithString: "Mic gain"), gainSlider, gainValue])
+        gainRow.orientation = .horizontal
+        gainRow.spacing = 8
+        gainSlider.widthAnchor.constraint(equalToConstant: 220).isActive = true
+
+        let permsTitle = NSTextField(labelWithString: "Permissions")
+        permsTitle.font = .boldSystemFont(ofSize: NSFont.smallSystemFontSize)
+        permsTitle.textColor = .secondaryLabelColor
+        let permissionsGroup = NSStackView(views: [permsTitle])
+        permissionsGroup.orientation = .vertical
+        permissionsGroup.alignment = .leading
+        permissionsGroup.spacing = 6
+        let permissions: [(String, () -> Bool, String)] = [
+            ("Microphone", { AVCaptureDevice.authorizationStatus(for: .audio) == .authorized },
+             "Privacy_Microphone"),
+            ("Screen Recording (system audio)", { CGPreflightScreenCaptureAccess() },
+             "Privacy_ScreenCapture"),
+        ]
+        for (name, granted, anchor) in permissions {
+            let dot = NSTextField(labelWithString: "●")
+            dot.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            let label = NSTextField(labelWithString: name)
+            label.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            let open = NSButton(title: "Open…", target: self, action: #selector(openPermissionPane(_:)))
+            open.bezelStyle = .inline
+            open.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            open.identifier = NSUserInterfaceItemIdentifier(anchor)
+            let row = NSStackView(views: [dot, label, NSView(), open])
+            row.orientation = .horizontal
+            row.spacing = 6
+            permissionsGroup.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: permissionsGroup.widthAnchor).isActive = true
+            permissionRows.append((dot, granted))
+        }
+
+        let stack = NSStackView(views: [engineControl, engineCaption, keyEntryRow, keyAddedRow,
+                                        gainRow, permissionsGroup])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+        stack.setCustomSpacing(20, after: engineCaption)
+        stack.setCustomSpacing(20, after: gainRow)
+        stack.edgeInsets = NSEdgeInsets(top: 20, left: 20, bottom: 20, right: 20)
+        for view in [engineControl, engineCaption, keyEntryRow, keyAddedRow, permissionsGroup] {
+            view.widthAnchor.constraint(equalToConstant: 380).isActive = true
+        }
+
+        let win = NSWindow(contentRect: .zero, styleMask: [.titled, .closable],
+                           backing: .buffered, defer: false)
+        win.title = "rec Settings"
+        win.contentView = stack
+        win.isReleasedWhenClosed = false
+        win.collectionBehavior = .moveToActiveSpace
+        stack.layoutSubtreeIfNeeded()
+        win.setContentSize(stack.fittingSize)
+        win.center()
+        window = win
+    }
+
+    private func refresh() {
+        let assemblyai = effectiveEngine() == .assemblyai
+        engineControl.selectedSegment = assemblyai ? 0 : 1
+        engineCaption.stringValue = assemblyai
+            ? "Best quality: speaker-labelled transcripts via AssemblyAI. Falls back to on-device whisper if a request fails."
+            : "Free, private, offline — whisper.cpp on this Mac. No speaker labels; noticeably weaker on meetings."
+        let hasKey = (config.apiKey?.count ?? 0) > 8
+        if let key = config.apiKey, hasKey {
+            keyAddedLabel.stringValue = "Key added · \(key.prefix(3))…\(key.suffix(4))"
+        }
+        keyEntryRow.isHidden = hasKey
+        keyAddedRow.isHidden = !hasKey
+        gainSlider.doubleValue = Double(config.micGain)
+        gainValue.stringValue = String(format: "%.0f×", config.micGain)
+    }
+
+    private func refreshPermissions() {
+        for (dot, granted) in permissionRows {
+            dot.textColor = granted() ? .systemGreen : .systemRed
+        }
+    }
+
+    @objc private func openPermissionPane(_ sender: NSButton) {
+        if let anchor = sender.identifier?.rawValue { openPrivacyPane(anchor) }
+    }
+
+    @objc private func engineToggled() {
+        if engineControl.selectedSegment == 1 {
+            updateConfigFile(["ENGINE": "local"])
+        } else if config.apiKey != nil {
+            updateConfigFile(["ENGINE": "assemblyai"])
+        } else {
+            engineControl.selectedSegment = 1 // no key yet — stay local
+            keyField.becomeFirstResponder()
+        }
+        refresh()
+    }
+
+    @objc private func addKeyTapped() {
+        let key = keyField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard key.count > 8 else { return }
+        updateConfigFile(["ASSEMBLYAI_API_KEY": key, "ENGINE": "assemblyai"])
+        keyField.stringValue = ""
+        refresh()
+    }
+
+    @objc private func replaceKeyTapped() {
+        keyAddedRow.isHidden = true
+        keyEntryRow.isHidden = false
+        keyField.becomeFirstResponder()
+    }
+
+    @objc private func gainChanged() {
+        updateConfigFile(["MIC_GAIN": String(format: "%.0f", gainSlider.doubleValue)])
+        gainValue.stringValue = String(format: "%.0f×", config.micGain)
+    }
+}
+
 // MARK: - Menu bar app
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let recorder = Recorder()
+    private let settings = SettingsController()
+    private var pill: NotchPill!
     private let toggleItem = NSMenuItem()
     private let statusLine = NSMenuItem()
     private var clock: Timer?
@@ -606,6 +985,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         try? FileManager.default.createDirectory(at: recordingsRoot, withIntermediateDirectories: true)
+        pill = NotchPill { [weak self] in
+            guard let self, self.recorder.isRecording else { return }
+            self.stopFlow()
+        }
         updateIcon()
 
         let menu = NSMenu()
@@ -619,6 +1002,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let open = NSMenuItem(title: "Recordings", action: #selector(openRecordings), keyEquivalent: "")
         open.target = self
         menu.addItem(open)
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+        if runningFromAppBundle {
+            let login = NSMenuItem(title: "Launch at Login",
+                                   action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
+            login.target = self
+            login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+            menu.addItem(login)
+        }
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit rec",
                                 action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -664,6 +1057,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 try await recorder.start()
                 NSSound(named: "Pop")?.play()
+                pill.showRecording(startedAt: recorder.startedAt ?? Date())
                 toggleItem.title = "Stop Recording"
                 clock = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                     guard let self, let started = self.recorder.startedAt else { return }
@@ -690,6 +1084,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
             guard hadAudio else {
                 NSSound(named: "Basso")?.play()
+                pill.hide()
                 showError("no audio captured — check Screen Recording + Microphone permissions")
                 try? FileManager.default.removeItem(at: folder)
                 updateIcon()
@@ -697,6 +1092,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
             transcribing += 1
+            pill.showTranscribing()
             updateIcon()
             let date = Date().addingTimeInterval(-duration)
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -705,6 +1101,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     guard let self else { return }
                     self.transcribing -= 1
                     self.updateIcon()
+                    if self.transcribing == 0, !self.recorder.isRecording { self.pill.hide() }
                     switch result {
                     case .success:
                         NSSound(named: "Glass")?.play()
@@ -724,6 +1121,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openRecordings() {
         NSWorkspace.shared.open(recordingsRoot)
+    }
+
+    @objc private func openSettings() {
+        settings.show()
+    }
+
+    @objc private func toggleLaunchAtLogin(_ item: NSMenuItem) {
+        do {
+            if SMAppService.mainApp.status == .enabled {
+                try SMAppService.mainApp.unregister()
+            } else {
+                try SMAppService.mainApp.register()
+            }
+        } catch {
+            NSSound.beep()
+        }
+        item.state = SMAppService.mainApp.status == .enabled ? .on : .off
     }
 }
 
