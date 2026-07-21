@@ -104,13 +104,32 @@ struct MeetingStore {
     static func markdownURL(_ folder: URL) -> URL { folder.appendingPathComponent("meeting.md") }
     static func pendingURL(_ folder: URL) -> URL { folder.appendingPathComponent("transcript.pending") }
 
-    /// Meeting folders that recorded fine but still lack a transcript.
-    static func pendingFolders() -> [URL] {
+    /// Every meeting folder, oldest first.
+    static func allFolders() -> [URL] {
         let folders = (try? FileManager.default.contentsOfDirectory(
-            at: recordingsRoot, includingPropertiesForKeys: nil)) ?? []
+            at: recordingsRoot, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
         return folders
-            .filter { FileManager.default.fileExists(atPath: pendingURL($0).path) }
+            .filter {
+                !$0.lastPathComponent.hasPrefix(".")
+                    && (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
+    }
+
+    /// Folders with audio but no transcript — an explicit .pending marker OR
+    /// an orphan (the app died before transcription ever started). Folders
+    /// whose audio changed in the last minute are skipped: that's a recording
+    /// still in progress.
+    static func pendingFolders() -> [URL] {
+        allFolders().filter { folder in
+            let fm = FileManager.default
+            guard fm.fileExists(atPath: audioURL(folder).path),
+                  !fm.fileExists(atPath: transcriptURL(folder).path) else { return false }
+            let attrs = try? fm.attributesOfItem(atPath: audioURL(folder).path)
+            if let modified = attrs?[.modificationDate] as? Date,
+               Date().timeIntervalSince(modified) < 60 { return false }
+            return true
+        }
     }
 }
 
@@ -1245,6 +1264,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusLine.title = "⚠ \(message.prefix(80))"
     }
 
+    /// Quit while recording used to abandon an unfinalized (unreadable) M4A.
+    /// Finish the writer first and leave the folder pending for `rec retry`.
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard recorder.isRecording else { return .terminateNow }
+        Task { @MainActor in
+            if let (folder, _, hadAudio) = await recorder.stop() {
+                if hadAudio {
+                    try? "app quit while recording".write(
+                        to: MeetingStore.pendingURL(folder), atomically: true, encoding: .utf8)
+                } else {
+                    try? FileManager.default.removeItem(at: folder)
+                }
+            }
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
+    }
+
     @objc private func openRecordings() {
         NSWorkspace.shared.open(recordingsRoot)
     }
@@ -1334,6 +1371,108 @@ func cmdSetupLocal() {
     print(status == 0 ? "done: \(defaultModelURL.path)" : "FAILED: \(out.prefix(300))")
 }
 
+// MARK: - CLI: list / show / search (the agent-facing surface)
+
+func meetingStatus(_ folder: URL) -> String {
+    let fm = FileManager.default
+    if fm.fileExists(atPath: MeetingStore.transcriptURL(folder).path) { return "ok" }
+    if fm.fileExists(atPath: MeetingStore.audioURL(folder).path) { return "pending" }
+    return "empty"
+}
+
+/// duration/engine as written in the meeting.md header.
+func meetingInfo(_ folder: URL) -> (duration: String?, engine: String?) {
+    guard let md = try? String(contentsOf: MeetingStore.markdownURL(folder), encoding: .utf8)
+    else { return (nil, nil) }
+    var duration: String?, engine: String?
+    for line in md.split(separator: "\n").prefix(6) {
+        if line.hasPrefix("- duration: ") { duration = String(line.dropFirst(12)) }
+        if line.hasPrefix("- engine: ") { engine = String(line.dropFirst(10)) }
+    }
+    return (duration, engine)
+}
+
+/// "latest", an exact folder name, or a unique-enough prefix (newest wins).
+func resolveMeeting(_ id: String) -> URL? {
+    let folders = MeetingStore.allFolders()
+    if id == "latest" {
+        return folders.last {
+            FileManager.default.fileExists(atPath: MeetingStore.markdownURL($0).path)
+        } ?? folders.last
+    }
+    if let exact = folders.first(where: { $0.lastPathComponent == id }) { return exact }
+    return folders.last { $0.lastPathComponent.hasPrefix(id) }
+}
+
+/// The matched line trimmed to ±window chars around the first match.
+func matchSnippet(_ line: String, term: String, window: Int = 80) -> String? {
+    guard let r = line.range(of: term, options: [.caseInsensitive, .diacriticInsensitive])
+    else { return nil }
+    let start = line.index(r.lowerBound, offsetBy: -window, limitedBy: line.startIndex) ?? line.startIndex
+    let end = line.index(r.upperBound, offsetBy: window, limitedBy: line.endIndex) ?? line.endIndex
+    var snippet = String(line[start..<end])
+    if start > line.startIndex { snippet = "…" + snippet }
+    if end < line.endIndex { snippet += "…" }
+    return snippet
+}
+
+func cmdList(json: Bool) {
+    let folders = Array(MeetingStore.allFolders().reversed())
+    if json {
+        let items: [[String: Any]] = folders.map { f in
+            let info = meetingInfo(f)
+            var item: [String: Any] = ["id": f.lastPathComponent, "path": f.path,
+                                       "status": meetingStatus(f)]
+            if let d = info.duration { item["duration"] = d }
+            if let e = info.engine { item["engine"] = e }
+            return item
+        }
+        let data = (try? JSONSerialization.data(withJSONObject: items,
+                                                options: [.prettyPrinted, .sortedKeys])) ?? Data("[]".utf8)
+        print(String(data: data, encoding: .utf8) ?? "[]")
+        return
+    }
+    guard !folders.isEmpty else {
+        print("no recordings in \(recordingsRoot.path)")
+        return
+    }
+    for f in folders {
+        let info = meetingInfo(f)
+        let status = meetingStatus(f)
+        let dur = (info.duration ?? "?").padding(toLength: 8, withPad: " ", startingAt: 0)
+        print("\(f.lastPathComponent)  \(dur)  \(status == "ok" ? info.engine ?? "ok" : status)")
+    }
+}
+
+func cmdShow(_ id: String) {
+    guard let folder = resolveMeeting(id) else {
+        fputs("rec: no meeting matching '\(id)' (see rec list)\n", stderr)
+        exit(1)
+    }
+    guard let text = try? String(contentsOf: MeetingStore.markdownURL(folder), encoding: .utf8) else {
+        fputs("rec: \(folder.lastPathComponent) has no transcript yet (\(meetingStatus(folder)) — try rec retry)\n", stderr)
+        exit(1)
+    }
+    print(text)
+}
+
+func cmdSearch(_ term: String) {
+    var hits = 0
+    for folder in MeetingStore.allFolders() {
+        guard let text = try? String(contentsOf: MeetingStore.markdownURL(folder), encoding: .utf8)
+        else { continue }
+        for (i, line) in text.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            guard let snippet = matchSnippet(String(line), term: term) else { continue }
+            print("\(folder.lastPathComponent):\(i + 1): \(snippet)")
+            hits += 1
+        }
+    }
+    if hits == 0 {
+        print("no matches for \"\(term)\"")
+        exit(1)
+    }
+}
+
 func cmdSelftest() {
     var failures = 0
     func expect(_ cond: Bool, _ name: String) {
@@ -1364,6 +1503,14 @@ func cmdSelftest() {
     let shapeOK = name.range(of: #"^\d{4}-\d{2}-\d{2}-\d{4}$"#, options: .regularExpression) != nil
     expect(shapeOK, "store: folder name shape")
 
+    expect(matchSnippet("falamos do razão na reunião", term: "razao") != nil,
+           "search: diacritic/case-insensitive match")
+    expect(matchSnippet("nada a ver", term: "razao") == nil, "search: no false match")
+    let long = String(repeating: "x", count: 200) + " razão " + String(repeating: "y", count: 200)
+    let snip = matchSnippet(long, term: "razão")!
+    expect(snip.hasPrefix("…") && snip.hasSuffix("…") && snip.count < 200,
+           "search: long lines trimmed around the match")
+
     print(failures == 0 ? "all selftests passed" : "\(failures) FAILED")
     exit(failures == 0 ? 0 : 1)
 }
@@ -1374,6 +1521,16 @@ let args = Array(CommandLine.arguments.dropFirst())
 switch args.first {
 case "check": cmdCheck(); exit(0)
 case "retry": cmdRetry(); exit(0)
+case "list": cmdList(json: args.contains("--json")); exit(0)
+case "show": cmdShow(args.count > 1 ? args[1] : "latest"); exit(0)
+case "search":
+    let term = args.dropFirst().joined(separator: " ")
+    guard !term.isEmpty else {
+        fputs("rec: usage: rec search <term>\n", stderr)
+        exit(1)
+    }
+    cmdSearch(term)
+    exit(0)
 case "setup-local": cmdSetupLocal(); exit(0)
 case "register-login":
     // Must run from inside the app bundle so SMAppService targets rec.app:
@@ -1395,13 +1552,16 @@ case "--help", "-h", "help":
     print("""
         rec — minimal meeting recorder (system audio + mic)
 
-        usage: rec [check|retry|setup-local|selftest]
+        usage: rec [list|show|search|check|retry|setup-local|selftest]
 
-          (no args)    run the menu bar app
-          check        diagnose permissions, keys and engines
-          retry        transcribe recordings that are still pending
-          setup-local  download the local whisper model (~550MB)
-          selftest     run unit tests
+          (no args)         run the menu bar app
+          list [--json]     meetings, newest first (id, duration, status)
+          show [id|latest]  print a meeting's transcript (meeting.md)
+          search <term>     find a term across all transcripts
+          check             diagnose permissions, keys and engines
+          retry             transcribe recordings that are still pending
+          setup-local       download the local whisper model (~550MB)
+          selftest          run unit tests
 
         config: ~/.rec with KEY=VALUE lines — ASSEMBLYAI_API_KEY, ENGINE
         (assemblyai|local), LANGUAGE (default pt), MIC_GAIN (default 10),

@@ -59,11 +59,17 @@ For the local engine: `brew install whisper-cpp` and `rec setup-local`
 ## CLI
 
 ```
-rec check        # diagnose permissions, keys, engines
-rec retry        # transcribe pending recordings
-rec setup-local  # download the local whisper model
-rec selftest     # unit tests
+rec list [--json]     # meetings, newest first: id, duration, status
+rec show [id|latest]  # print a meeting's transcript
+rec search <term>     # find a term across all transcripts (accent-insensitive)
+rec check             # diagnose permissions, keys, engines
+rec retry             # transcribe pending recordings
+rec setup-local       # download the local whisper model
+rec selftest          # unit tests
 ```
+
+`list`/`show`/`search` are the agent-facing surface — point your agent at
+them (or straight at the files) instead of an MCP server.
 
 ## License
 
