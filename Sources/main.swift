@@ -1375,6 +1375,21 @@ switch args.first {
 case "check": cmdCheck(); exit(0)
 case "retry": cmdRetry(); exit(0)
 case "setup-local": cmdSetupLocal(); exit(0)
+case "register-login":
+    // Must run from inside the app bundle so SMAppService targets rec.app:
+    //   /Applications/rec.app/Contents/MacOS/rec register-login
+    guard runningFromAppBundle else {
+        fputs("rec: run this from the app bundle: /Applications/rec.app/Contents/MacOS/rec register-login\n", stderr)
+        exit(1)
+    }
+    do {
+        try SMAppService.mainApp.register()
+        print("launch at login: enabled")
+        exit(0)
+    } catch {
+        fputs("rec: register failed: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
 case "selftest": cmdSelftest()
 case "--help", "-h", "help":
     print("""
