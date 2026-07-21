@@ -17,9 +17,20 @@ one API provider, and writes plain files. Files are the API.
 - **Trigger**: manual only — click menu bar icon to start/stop; icon pulses
   red while recording. No call auto-detection (Anarlog keeps running in
   parallel as safety net).
-- **Transcription**: one provider, winner of the jul/2026 benchmark (candidate:
-  current Gemini Flash — native diarization, BYO key). On stop: upload, save
-  result. On failure: keep audio, mark pending, `rec retry`.
+- **Transcription**: two engines, mirroring talk's local/remote split.
+  - **assemblyai** (default): winner of the jul/2026 benchmark on real PT-BR
+    meeting audio — correct diarization ([A]/[B]), right names ("Mari"),
+    zero hallucination on silence, ~17s for 5min, upload+poll REST (2 calls).
+    Beat gemini-3.5-flash (hallucinated a full dialogue on silent audio),
+    gpt-4o-transcribe-diarize (hallucinated Russian, 88s) and whisper-1
+    (best raw text but no speakers).
+  - **local** (fallback/offline/privacy): whisper.cpp via `whisper-cli`
+    (brew) + ggml-large-v3-turbo-q5_0, run with `-mc 0 -l pt`. 19× realtime
+    on this Mac, but measurably worse on meetings: no speakers, drops
+    passages, occasional phrase loops. Used when the API fails, there's no
+    network, or ENGINE=local is set. Model downloaded on demand.
+  - On stop: transcribe, save. On failure: keep audio, mark pending,
+    `rec retry`.
 - **Storage** (no database):
   ```
   ~/recordings/2026-07-20-1830-meeting-name/
