@@ -394,6 +394,11 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         // AAC 16kHz mono 32kbps: speech-tuned, ~4KB/s, encoder downmixes the
         // 48kHz stereo input on the fly.
         let w = try AVAssetWriter(outputURL: audioURL, fileType: .m4a)
+        // Fragmented writing: the moov gets flushed every 10s of media, so a
+        // crash mid-recording loses at most the last fragment instead of the
+        // whole file (an unfinished non-fragmented m4a has no moov and is
+        // unreadable). afconvert and AssemblyAI both accept fragmented m4a.
+        w.movieFragmentInterval = CMTime(seconds: 10, preferredTimescale: 600)
         let input = AVAssetWriterInput(mediaType: .audio, outputSettings: [
             AVFormatIDKey: kAudioFormatMPEG4AAC,
             AVSampleRateKey: 16000,
