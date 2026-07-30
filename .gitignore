@@ -1,7 +1,7 @@
 benchmark/corpus/
 benchmark/results/
 benchmark/models/
-rec
-rec.app/
+/rec
+/rec.app/
 build/
 _CodeSignature/

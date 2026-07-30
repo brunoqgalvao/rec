@@ -31,6 +31,15 @@ Makefile, no dependencies.
 
 ## Install
 
+One command on a fresh Mac — clones, builds, installs the app + CLI + Claude
+Code skill, and walks you through engine setup:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/brunoqgalvao/rec/main/setup.sh | bash
+```
+
+Or by hand:
+
 ```sh
 git clone https://github.com/brunoqgalvao/rec && cd rec
 make install-app       # builds and copies rec.app to /Applications
@@ -69,7 +78,9 @@ rec selftest          # unit tests
 ```
 
 `list`/`show`/`search` are the agent-facing surface — point your agent at
-them (or straight at the files) instead of an MCP server.
+them (or straight at the files) instead of an MCP server. For Claude Code
+there's a ready-made skill in `skills/rec/`; setup.sh symlinks it into
+`~/.claude/skills/rec` (or do so by hand).
 
 ## License
 
